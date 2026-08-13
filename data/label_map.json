@@ -1,0 +1,7 @@
+{
+    "not_hate": 0,
+    "weak_hate": 1,
+    "moderate_hate": 2,
+    "strong_hate": 3,
+    "extreme_hate": 4
+}

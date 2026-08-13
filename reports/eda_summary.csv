@@ -1,0 +1,2 @@
+rows,columns,unique_comments,duplicate_rows,avg_annotations_per_comment,max_annotations_per_comment,avg_word_count,avg_char_count,hate_score_mean,hate_score_std,num_target_columns
+135556,134,39565,95991,3.4261594843927714,815,27.012327008763904,151.24074183363334,-0.5674283690873144,2.380003250762786,53
