@@ -1,8 +1,10 @@
+torch
+transformers
 datasets
 pandas
+pyarrow
+scikit-learn
+accelerate
 numpy
 matplotlib
 seaborn
-scikit-learn
-pyarrow
-transformers
