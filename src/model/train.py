@@ -232,14 +232,14 @@ print()
 # 8. CREATE LABEL MAPPINGS
 # ============================================================
 
-id2label = {
-    int(label_id): label_name
-    for label_id, label_name in raw_label_map.items()
+label2id = {
+    label_name: int(label_id)
+    for label_name, label_id in raw_label_map.items()
 }
 
-label2id = {
-    label_name: label_id
-    for label_id, label_name in id2label.items()
+id2label = {
+    label_id: label_name
+    for label_name, label_id in label2id.items()
 }
 
 print("id2label:")
