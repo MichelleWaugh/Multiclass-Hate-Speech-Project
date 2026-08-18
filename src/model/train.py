@@ -1,55 +1,63 @@
-
 """
 BERT Baseline Training Script
 Project: Multiclass Hate Speech Detection and Severity Analysis using Transformers
 
 ML Engineer:
     - Fine-tune bert-base-uncased
-    - 5-class hate speech classification
-    - Evaluate using accuracy, macro F1, and per-class F1
-    - Save trained model and tokenizer
+    - 5-class hate speech severity classification
+    - Evaluate accuracy, precision, recall, macro F1, weighted F1
+    - Save trained model, tokenizer, metrics, and classification report
 
-Expected input:
-    data/processed/train.parquet
-    data/processed/val.parquet
-    data/processed/test.parquet
+Expected project structure:
+    project_root/
+    ├── data/
+    │   ├── label_map.json
+    │   └── processed/
+    │       ├── train.parquet
+    │       ├── val.parquet
+    │       └── test.parquet
+    ├── src/
+    │   └── model/
+    │       └── train.py
+    └── models/
+        └── bert_hate_v1/
 
-Expected columns:
-    text
-    label
+Supported label_map.json formats:
+    {"not_hate": 0, "weak_hate": 1, ...}
+or:
+    {"0": "not_hate", "1": "weak_hate", ...}
 
-Labels:
+Expected final label IDs:
     0 -> not_hate
     1 -> weak_hate
     2 -> moderate_hate
     3 -> strong_hate
     4 -> extreme_hate
-
-Output:
-    models/bert_hate_v1/
 """
 
-import os
 import json
+import os
 import random
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import torch
 
 from datasets import Dataset
-from transformers import (
-    BertTokenizerFast,
-    BertForSequenceClassification,
-    Trainer,
-    TrainingArguments,
-    DataCollatorWithPadding,
-    set_seed,
-)
-
 from sklearn.metrics import (
     accuracy_score,
-    f1_score,
     classification_report,
+    confusion_matrix,
+    precision_recall_fscore_support,
+)
+from transformers import (
+    BertForSequenceClassification,
+    BertTokenizerFast,
+    DataCollatorWithPadding,
+    Trainer,
+    TrainingArguments,
+    set_seed,
 )
 
 
@@ -60,28 +68,46 @@ from sklearn.metrics import (
 MODEL_NAME = "bert-base-uncased"
 
 NUM_LABELS = 5
-
 MAX_LENGTH = 128
 
 LEARNING_RATE = 2e-5
-
 BATCH_SIZE = 16
-
 NUM_EPOCHS = 4
 
-WARMUP_STEPS = 500
+# If the T4 gives CUDA OOM, change:
+# BATCH_SIZE = 8
+# GRADIENT_ACCUMULATION_STEPS = 2
+GRADIENT_ACCUMULATION_STEPS = 1
 
+WARMUP_RATIO = 0.1
 WEIGHT_DECAY = 0.01
-
 SEED = 42
 
-TRAIN_PATH = "data/processed/train.parquet"
-VAL_PATH = "data/processed/val.parquet"
-TEST_PATH = "data/processed/test.parquet"
+# ------------------------------------------------------------
+# Resolve paths from the repository root instead of relying
+# on the current working directory.
+#
+# train.py is expected at:
+# project_root/src/model/train.py
+# ------------------------------------------------------------
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
-OUTPUT_DIR = "models/bert_hate_v1"
+TRAIN_PATH = PROJECT_ROOT / "data" / "processed" / "train.parquet"
+VAL_PATH = PROJECT_ROOT / "data" / "processed" / "val.parquet"
+TEST_PATH = PROJECT_ROOT / "data" / "processed" / "test.parquet"
 
-LABEL_MAP_PATH = "data/label_map.json"
+LABEL_MAP_PATH = PROJECT_ROOT / "data" / "label_map.json"
+
+OUTPUT_DIR = PROJECT_ROOT / "models" / "bert_hate_v1"
+
+
+DEFAULT_LABEL_MAP = {
+    "not_hate": 0,
+    "weak_hate": 1,
+    "moderate_hate": 2,
+    "strong_hate": 3,
+    "extreme_hate": 4,
+}
 
 
 # ============================================================
@@ -89,7 +115,6 @@ LABEL_MAP_PATH = "data/label_map.json"
 # ============================================================
 
 set_seed(SEED)
-
 random.seed(SEED)
 np.random.seed(SEED)
 torch.manual_seed(SEED)
@@ -106,9 +131,16 @@ print("=" * 70)
 print("DEVICE INFORMATION")
 print("=" * 70)
 
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
 if torch.cuda.is_available():
     print("CUDA available: YES")
     print("GPU:", torch.cuda.get_device_name(0))
+    print(
+        "GPU memory:",
+        round(torch.cuda.get_device_properties(0).total_memory / 1024**3, 2),
+        "GB",
+    )
 else:
     print("CUDA available: NO")
     print("Training will use CPU.")
@@ -131,12 +163,17 @@ required_files = [
 ]
 
 for path in required_files:
-    if not os.path.exists(path):
-        raise FileNotFoundError(
-            f"Required file not found: {path}"
-        )
+    if not path.exists():
+        raise FileNotFoundError(f"Required file not found: {path}")
 
 print("All Parquet files found.")
+
+if not LABEL_MAP_PATH.exists():
+    print(
+        f"WARNING: {LABEL_MAP_PATH} not found. "
+        "Using the default label mapping."
+    )
+
 print()
 
 
@@ -169,6 +206,10 @@ print()
 # 6. BASIC DATA VALIDATION
 # ============================================================
 
+print("=" * 70)
+print("VALIDATING DATA")
+print("=" * 70)
+
 required_columns = {"text", "label"}
 
 for split_name, df in [
@@ -180,8 +221,7 @@ for split_name, df in [
 
     if missing_columns:
         raise ValueError(
-            f"{split_name} dataset is missing columns: "
-            f"{missing_columns}"
+            f"{split_name} dataset is missing columns: {missing_columns}"
         )
 
     if df["text"].isnull().any():
@@ -194,85 +234,142 @@ for split_name, df in [
             f"{split_name} dataset contains null labels."
         )
 
+    # Convert labels to integers if possible.
+    try:
+        df["label"] = df["label"].astype(int)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"{split_name} labels must be integer IDs 0-{NUM_LABELS - 1}. "
+            f"Found dtype: {df['label'].dtype}"
+        ) from exc
+
+    invalid_labels = sorted(
+        set(df["label"].unique()) - set(range(NUM_LABELS))
+    )
+
+    if invalid_labels:
+        raise ValueError(
+            f"{split_name} contains invalid labels: {invalid_labels}. "
+            f"Expected labels: 0-{NUM_LABELS - 1}."
+        )
+
 print("Data validation passed.")
 print()
 
 
 # ============================================================
-# 7. LOAD LABEL MAP
+# 7. LOAD AND NORMALIZE LABEL MAP
 # ============================================================
 
-if os.path.exists(LABEL_MAP_PATH):
+print("=" * 70)
+print("LOADING LABEL MAP")
+print("=" * 70)
 
-    with open(LABEL_MAP_PATH, "r", encoding="utf-8") as f:
-        raw_label_map = json.load(f)
 
-    print("Loaded label map:")
-    print(raw_label_map)
+def load_label_map(path: Path) -> dict:
+    """
+    Load either of these formats:
 
-else:
+        {"not_hate": 0, "weak_hate": 1, ...}
 
-    print(
-        "WARNING: label_map.json not found. "
-        "Using default label mapping."
+    or:
+
+        {"0": "not_hate", "1": "weak_hate", ...}
+
+    Always return:
+        label2id = {"not_hate": 0, ...}
+    """
+    if not path.exists():
+        print("Using default label mapping:")
+        print(DEFAULT_LABEL_MAP)
+        return DEFAULT_LABEL_MAP.copy()
+
+    with open(path, "r", encoding="utf-8") as file:
+        raw_map = json.load(file)
+
+    if not isinstance(raw_map, dict) or not raw_map:
+        raise ValueError("label_map.json must contain a non-empty JSON object.")
+
+    label2id = {}
+
+    # Format A:
+    # {"not_hate": 0, "weak_hate": 1, ...}
+    if all(
+        isinstance(key, str) and not key.lstrip("-").isdigit()
+        for key in raw_map.keys()
+    ):
+        for label_name, label_id in raw_map.items():
+            try:
+                label2id[str(label_name)] = int(label_id)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"Invalid label ID for '{label_name}': {label_id}"
+                ) from exc
+
+    # Format B:
+    # {"0": "not_hate", "1": "weak_hate", ...}
+    else:
+        for label_id, label_name in raw_map.items():
+            try:
+                numeric_id = int(label_id)
+            except ValueError as exc:
+                raise ValueError(
+                    f"Invalid numeric label ID: {label_id}"
+                ) from exc
+
+            label2id[str(label_name)] = numeric_id
+
+    return label2id
+
+
+label2id = load_label_map(LABEL_MAP_PATH)
+
+expected_label2id = DEFAULT_LABEL_MAP
+
+if label2id != expected_label2id:
+    raise ValueError(
+        "The label mapping does not match the project's expected "
+        f"5-class mapping.\n"
+        f"Expected: {expected_label2id}\n"
+        f"Found:    {label2id}"
     )
-
-    raw_label_map = {
-        "0": "not_hate",
-        "1": "weak_hate",
-        "2": "moderate_hate",
-        "3": "strong_hate",
-        "4": "extreme_hate",
-    }
-
-print()
-
-
-# ============================================================
-# 8. CREATE LABEL MAPPINGS
-# ============================================================
-
-label2id = {
-    label_name: int(label_id)
-    for label_name, label_id in raw_label_map.items()
-}
 
 id2label = {
     label_id: label_name
     for label_name, label_id in label2id.items()
 }
 
-print("id2label:")
-print(id2label)
-
-print("\nlabel2id:")
+print("label2id:")
 print(label2id)
+
+print("\nid2label:")
+print(id2label)
 
 print()
 
 
 # ============================================================
-# 9. CONVERT PANDAS → HUGGINGFACE DATASET
+# 8. CONVERT PANDAS -> HUGGING FACE DATASETS
 # ============================================================
+
+print("=" * 70)
+print("CREATING HUGGING FACE DATASETS")
+print("=" * 70)
 
 train_dataset = Dataset.from_pandas(
     train_df[["text", "label"]],
-    preserve_index=False
+    preserve_index=False,
 )
 
 val_dataset = Dataset.from_pandas(
     val_df[["text", "label"]],
-    preserve_index=False
+    preserve_index=False,
 )
 
 test_dataset = Dataset.from_pandas(
     test_df[["text", "label"]],
-    preserve_index=False
+    preserve_index=False,
 )
-
-print("=" * 70)
-print("HUGGINGFACE DATASETS")
-print("=" * 70)
 
 print(train_dataset)
 print(val_dataset)
@@ -282,40 +379,29 @@ print()
 
 
 # ============================================================
-# 10. LOAD TOKENIZER
+# 9. LOAD TOKENIZER
 # ============================================================
 
 print("=" * 70)
 print("LOADING TOKENIZER")
 print("=" * 70)
 
-tokenizer = BertTokenizerFast.from_pretrained(
-    MODEL_NAME
-)
+tokenizer = BertTokenizerFast.from_pretrained(MODEL_NAME)
 
-print("Tokenizer loaded.")
+print("Tokenizer loaded:", MODEL_NAME)
 print()
 
 
 # ============================================================
-# 11. TOKENIZATION
+# 10. TOKENIZATION
 # ============================================================
 
+print("=" * 70)
+print("TOKENIZING DATA")
+print("=" * 70)
+
+
 def tokenize_function(examples):
-    """
-    Tokenize input text using BERT tokenizer.
-
-    truncation=True:
-        Cuts text if it exceeds MAX_LENGTH.
-
-    max_length=MAX_LENGTH:
-        Maximum number of tokens.
-
-    padding=False:
-        Dynamic padding will be handled later by
-        DataCollatorWithPadding.
-    """
-
     return tokenizer(
         examples["text"],
         truncation=True,
@@ -323,10 +409,6 @@ def tokenize_function(examples):
         padding=False,
     )
 
-
-print("=" * 70)
-print("TOKENIZING DATA")
-print("=" * 70)
 
 train_dataset = train_dataset.map(
     tokenize_function,
@@ -351,16 +433,17 @@ print()
 
 
 # ============================================================
-# 12. DATA COLLATOR
+# 11. DATA COLLATOR
 # ============================================================
 
 data_collator = DataCollatorWithPadding(
-    tokenizer=tokenizer
+    tokenizer=tokenizer,
+    padding=True,
 )
 
 
 # ============================================================
-# 13. LOAD BERT MODEL
+# 12. LOAD BERT MODEL
 # ============================================================
 
 print("=" * 70)
@@ -374,160 +457,143 @@ model = BertForSequenceClassification.from_pretrained(
     label2id=label2id,
 )
 
-print("Model loaded:")
-print(MODEL_NAME)
-
+print("Model loaded:", MODEL_NAME)
+print("Number of labels:", NUM_LABELS)
 print()
 
 
 # ============================================================
-# 14. COMPUTE METRICS
+# 13. METRICS
 # ============================================================
 
 def compute_metrics(eval_prediction):
     """
-    Calculate evaluation metrics.
-
-    Returns:
-        accuracy
-        macro F1
-        per-class F1
+    Metrics used during validation and model selection.
     """
 
-    predictions, labels = eval_prediction
+    predictions = eval_prediction.predictions
+    labels = eval_prediction.label_ids
 
-    # predictions shape:
-    # [number_of_samples, number_of_classes]
+    if isinstance(predictions, tuple):
+        predictions = predictions[0]
 
-    predicted_labels = np.argmax(
-        predictions,
-        axis=-1
+    predicted_labels = np.argmax(predictions, axis=-1)
+
+    accuracy = accuracy_score(labels, predicted_labels)
+
+    precision_macro, recall_macro, f1_macro, _ = (
+        precision_recall_fscore_support(
+            labels,
+            predicted_labels,
+            average="macro",
+            zero_division=0,
+        )
     )
 
-    # Accuracy
-    accuracy = accuracy_score(
-        labels,
-        predicted_labels
-    )
-
-    # Macro F1
-    macro_f1 = f1_score(
-        labels,
-        predicted_labels,
-        average="macro",
-        zero_division=0
-    )
-
-    # Per-class F1
-    per_class_f1 = f1_score(
+    _, _, f1_weighted, _ = precision_recall_fscore_support(
         labels,
         predicted_labels,
-        average=None,
-        labels=list(range(NUM_LABELS)),
-        zero_division=0
+        average="weighted",
+        zero_division=0,
     )
 
-    metrics = {
+    return {
         "accuracy": float(accuracy),
-        "macro_f1": float(macro_f1),
+        "precision_macro": float(precision_macro),
+        "recall_macro": float(recall_macro),
+        "macro_f1": float(f1_macro),
+        "weighted_f1": float(f1_weighted),
     }
 
-    # Add class-specific F1 scores
-    for class_id, class_f1 in enumerate(per_class_f1):
-
-        class_name = id2label.get(
-            class_id,
-            f"class_{class_id}"
-        )
-
-        metrics[f"f1_{class_name}"] = float(
-            class_f1
-        )
-
-    return metrics
-
 
 # ============================================================
-# 15. TRAINING ARGUMENTS
+# 14. TRAINING ARGUMENTS
 # ============================================================
+
+print("=" * 70)
+print("TRAINING CONFIGURATION")
+print("=" * 70)
+
+print("Model:", MODEL_NAME)
+print("Classes:", NUM_LABELS)
+print("Max length:", MAX_LENGTH)
+print("Batch size:", BATCH_SIZE)
+print("Gradient accumulation:", GRADIENT_ACCUMULATION_STEPS)
+print("Epochs:", NUM_EPOCHS)
+print("Learning rate:", LEARNING_RATE)
+print("Weight decay:", WEIGHT_DECAY)
+print("Warmup ratio:", WARMUP_RATIO)
+print("Output:", OUTPUT_DIR)
+
+print()
+
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 training_args = TrainingArguments(
+    output_dir=str(OUTPUT_DIR),
 
-    # Where checkpoints/results are stored
-    output_dir=OUTPUT_DIR,
-
-    # Training hyperparameters
+    # Hyperparameters
     learning_rate=LEARNING_RATE,
-
     per_device_train_batch_size=BATCH_SIZE,
-
     per_device_eval_batch_size=BATCH_SIZE,
-
+    gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS,
     num_train_epochs=NUM_EPOCHS,
-
     weight_decay=WEIGHT_DECAY,
+    warmup_ratio=WARMUP_RATIO,
 
-    warmup_steps=WARMUP_STEPS,
-
-    # Evaluation
+    # Evaluation and checkpointing
     eval_strategy="epoch",
-
-    # Save after each epoch
     save_strategy="epoch",
-
-    # Keep best model
     load_best_model_at_end=True,
-
     metric_for_best_model="macro_f1",
-
     greater_is_better=True,
 
     # Logging
     logging_strategy="steps",
-
     logging_steps=100,
+    report_to="none",
 
     # Reproducibility
     seed=SEED,
 
-    # Prevent excessive checkpoint storage
+    # Checkpoint management
     save_total_limit=2,
 
-    # Performance
+    # T4-friendly mixed precision
     fp16=torch.cuda.is_available(),
 
-    # Report nowhere by default
-    report_to="none",
-
-    # Keep output manageable
+    # Keep progress visible
     disable_tqdm=False,
 )
 
 
 # ============================================================
-# 16. CREATE TRAINER
+# 15. CREATE TRAINER
 # ============================================================
 
+print("=" * 70)
+print("CREATING TRAINER")
+print("=" * 70)
+
 trainer = Trainer(
-
     model=model,
-
     args=training_args,
-
     train_dataset=train_dataset,
-
     eval_dataset=val_dataset,
 
-    tokenizer=tokenizer,
+    # Newer Transformers versions use processing_class.
+    processing_class=tokenizer,
 
     data_collator=data_collator,
-
     compute_metrics=compute_metrics,
 )
 
+print("Trainer created successfully.")
+print()
+
 
 # ============================================================
-# 17. TRAIN
+# 16. TRAIN
 # ============================================================
 
 print("=" * 70)
@@ -535,37 +601,52 @@ print("STARTING BERT TRAINING")
 print("=" * 70)
 
 print()
-print("Model:", MODEL_NAME)
-print("Classes:", NUM_LABELS)
-print("Learning rate:", LEARNING_RATE)
-print("Batch size:", BATCH_SIZE)
-print("Epochs:", NUM_EPOCHS)
-print("Max length:", MAX_LENGTH)
-print("Warmup steps:", WARMUP_STEPS)
-print("Weight decay:", WEIGHT_DECAY)
-print()
 
-train_result = trainer.train()
+try:
+    train_result = trainer.train()
+except torch.cuda.OutOfMemoryError as exc:
+    print()
+    print("=" * 70)
+    print("CUDA OUT OF MEMORY")
+    print("=" * 70)
+    print(
+        "The T4 did not have enough GPU memory for the current batch size."
+    )
+    print()
+    print("Recommended fallback:")
+    print("    BATCH_SIZE = 8")
+    print("    GRADIENT_ACCUMULATION_STEPS = 2")
+    print()
+    print("This gives an effective batch size of approximately 16.")
+    print("=" * 70)
+    raise exc
 
 
 # ============================================================
-# 18. SAVE MODEL
+# 17. SAVE TRAINING STATE + MODEL + TOKENIZER
 # ============================================================
 
 print("=" * 70)
 print("SAVING MODEL")
 print("=" * 70)
 
-trainer.save_model(OUTPUT_DIR)
+trainer.save_model(str(OUTPUT_DIR))
+tokenizer.save_pretrained(str(OUTPUT_DIR))
 
-tokenizer.save_pretrained(OUTPUT_DIR)
+# Save trainer state as well.
+trainer.save_state()
+
+# Save training metrics.
+train_metrics = train_result.metrics
+trainer.log_metrics("train", train_metrics)
+trainer.save_metrics("train", train_metrics)
 
 print(f"Model saved to: {OUTPUT_DIR}")
 print()
 
 
 # ============================================================
-# 19. VALIDATION EVALUATION
+# 18. VALIDATION EVALUATION
 # ============================================================
 
 print("=" * 70)
@@ -573,8 +654,11 @@ print("VALIDATION EVALUATION")
 print("=" * 70)
 
 validation_metrics = trainer.evaluate(
-    eval_dataset=val_dataset
+    eval_dataset=val_dataset,
 )
+
+trainer.log_metrics("validation", validation_metrics)
+trainer.save_metrics("validation", validation_metrics)
 
 for key, value in validation_metrics.items():
     print(f"{key}: {value}")
@@ -583,7 +667,7 @@ print()
 
 
 # ============================================================
-# 20. TEST EVALUATION
+# 19. TEST EVALUATION
 # ============================================================
 
 print("=" * 70)
@@ -592,8 +676,11 @@ print("=" * 70)
 
 test_metrics = trainer.evaluate(
     eval_dataset=test_dataset,
-    metric_key_prefix="test"
+    metric_key_prefix="test",
 )
+
+trainer.log_metrics("test", test_metrics)
+trainer.save_metrics("test", test_metrics)
 
 for key, value in test_metrics.items():
     print(f"{key}: {value}")
@@ -602,20 +689,23 @@ print()
 
 
 # ============================================================
-# 21. CLASSIFICATION REPORT ON TEST SET
+# 20. TEST CLASSIFICATION REPORT
 # ============================================================
 
 print("=" * 70)
 print("TEST CLASSIFICATION REPORT")
 print("=" * 70)
 
-prediction_output = trainer.predict(
-    test_dataset
-)
+prediction_output = trainer.predict(test_dataset)
+
+test_predictions = prediction_output.predictions
+
+if isinstance(test_predictions, tuple):
+    test_predictions = test_predictions[0]
 
 test_predictions = np.argmax(
-    prediction_output.predictions,
-    axis=-1
+    test_predictions,
+    axis=-1,
 )
 
 test_labels = prediction_output.label_ids
@@ -625,7 +715,7 @@ target_names = [
     for i in range(NUM_LABELS)
 ]
 
-report = classification_report(
+report_text = classification_report(
     test_labels,
     test_predictions,
     labels=list(range(NUM_LABELS)),
@@ -633,57 +723,131 @@ report = classification_report(
     zero_division=0,
 )
 
-print(report)
+report_dict = classification_report(
+    test_labels,
+    test_predictions,
+    labels=list(range(NUM_LABELS)),
+    target_names=target_names,
+    zero_division=0,
+    output_dict=True,
+)
+
+print(report_text)
 
 
 # ============================================================
-# 22. SAVE BASIC TRAINING RESULTS
+# 21. CONFUSION MATRIX
 # ============================================================
+
+print("=" * 70)
+print("CONFUSION MATRIX")
+print("=" * 70)
+
+cm = confusion_matrix(
+    test_labels,
+    test_predictions,
+    labels=list(range(NUM_LABELS)),
+)
+
+print(cm)
+
+confusion_matrix_path = OUTPUT_DIR / "confusion_matrix.csv"
+
+cm_df = pd.DataFrame(
+    cm,
+    index=target_names,
+    columns=target_names,
+)
+
+cm_df.to_csv(confusion_matrix_path)
+
+print(f"\nConfusion matrix saved to: {confusion_matrix_path}")
+print()
+
+
+# ============================================================
+# 22. SAVE CLASSIFICATION REPORT
+# ============================================================
+
+report_path = OUTPUT_DIR / "classification_report.json"
+
+with open(report_path, "w", encoding="utf-8") as file:
+    json.dump(report_dict, file, indent=4)
+
+report_txt_path = OUTPUT_DIR / "classification_report.txt"
+
+with open(report_txt_path, "w", encoding="utf-8") as file:
+    file.write(report_text)
+
+print(f"Classification report saved to: {report_path}")
+print(f"Classification report text saved to: {report_txt_path}")
+print()
+
+
+# ============================================================
+# 23. SAVE COMPLETE TRAINING RESULTS
+# ============================================================
+
+def make_json_serializable(value):
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, (np.floating,)):
+        return float(value)
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    return value
+
 
 results = {
     "model": MODEL_NAME,
     "num_labels": NUM_LABELS,
+    "id2label": {
+        str(key): value
+        for key, value in id2label.items()
+    },
+    "label2id": label2id,
     "max_length": MAX_LENGTH,
     "learning_rate": LEARNING_RATE,
     "batch_size": BATCH_SIZE,
+    "gradient_accumulation_steps": GRADIENT_ACCUMULATION_STEPS,
+    "effective_batch_size": (
+        BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS
+    ),
     "epochs": NUM_EPOCHS,
-    "warmup_steps": WARMUP_STEPS,
+    "warmup_ratio": WARMUP_RATIO,
     "weight_decay": WEIGHT_DECAY,
     "seed": SEED,
+    "device": DEVICE,
+    "gpu": (
+        torch.cuda.get_device_name(0)
+        if torch.cuda.is_available()
+        else "CPU"
+    ),
+    "train_metrics": {
+        key: make_json_serializable(value)
+        for key, value in train_metrics.items()
+    },
     "validation_metrics": {
-        key: float(value)
+        key: make_json_serializable(value)
         for key, value in validation_metrics.items()
-        if isinstance(value, (int, float))
     },
     "test_metrics": {
-        key: float(value)
+        key: make_json_serializable(value)
         for key, value in test_metrics.items()
-        if isinstance(value, (int, float))
     },
-    "classification_report": report,
+    "classification_report": report_dict,
 }
 
-results_path = os.path.join(
-    OUTPUT_DIR,
-    "training_results.json"
-)
+results_path = OUTPUT_DIR / "training_results.json"
 
-with open(
-    results_path,
-    "w",
-    encoding="utf-8"
-) as f:
-
-    json.dump(
-        results,
-        f,
-        indent=4
-    )
+with open(results_path, "w", encoding="utf-8") as file:
+    json.dump(results, file, indent=4)
 
 print("=" * 70)
 print("TRAINING COMPLETE")
 print("=" * 70)
-
 print(f"Model directory: {OUTPUT_DIR}")
 print(f"Results file: {results_path}")
-
+print(f"Classification report: {report_path}")
+print(f"Confusion matrix: {confusion_matrix_path}")
+print("=" * 70)
